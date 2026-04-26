@@ -1,0 +1,13 @@
+.git
+.gitignore
+.idea
+.vscode
+tmp
+dist
+bin
+*.exe
+*.out
+coverage.out
+data
+config/config.yaml
+

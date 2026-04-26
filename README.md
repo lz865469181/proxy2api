@@ -46,6 +46,44 @@ go run ./cmd/proxy2api -config config/config.yaml
 
 Default listen: `:8080`.
 
+## Docker Local Deployment
+
+1. Bootstrap config file:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-config.ps1
+```
+
+2. Edit `config/config.yaml`:
+
+- `auth.admin_key`
+- `keys[].key`
+- `providers[].upstream_keys[]`
+
+3. Start with Docker Compose:
+
+```bash
+docker compose up -d --build
+```
+
+4. Check status:
+
+```bash
+docker compose ps
+curl http://localhost:8080/healthz
+```
+
+5. Stop:
+
+```bash
+docker compose down
+```
+
+Notes:
+
+- `./config` and `./data` are mounted into container, data persists locally.
+- Default container command uses `/app/config/config.yaml`.
+
 ## Runtime Model
 
 At startup:
@@ -79,6 +117,14 @@ Admin (`X-Admin-Key` required):
 - `GET /admin/stats`
 - `POST /admin/reload`
 - `GET /admin/ui`
+- `GET /admin/rules`
+- `POST /admin/rules`
+- `DELETE /admin/rules?id={id}`
+- `GET /admin/schedules`
+- `POST /admin/schedules`
+- `DELETE /admin/schedules?id={id}`
+- `GET /admin/config/export`
+- `POST /admin/config/import`
 
 ## Rule Context
 
@@ -106,4 +152,12 @@ Run:
 
 ```bash
 go test ./...
+```
+
+Optional Docker validation:
+
+```bash
+docker compose config
+docker compose up -d --build
+docker compose logs -f proxy2api
 ```
