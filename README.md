@@ -40,6 +40,9 @@ cp config/config.example.yaml config/config.yaml
 - `keys[].key`
 - `providers[].upstream_keys[]`
 - DB and Redis section if needed
+- single-node recommended baseline:
+  - `db.driver: sqlite`
+  - `redis.enabled: false`
 
 3. Start:
 
@@ -135,6 +138,8 @@ Public:
 - `GET /v1/models`
 - `POST /v1/chat/completions` (or other `/v1/*`)
 - `GET /metrics`
+- `POST /anthropic/v1/messages` (compat)
+- `POST /gemini/v1*/models/*:generateContent` (compat)
 
 Admin (`X-Admin-Key` required):
 
@@ -157,6 +162,21 @@ Admin (`X-Admin-Key` required):
 - `GET /admin/api-keys`
 - `POST /admin/api-keys`
 - `DELETE /admin/api-keys?id={id}`
+- `POST /admin/auth/login`
+- `GET/POST/DELETE /admin/tenants`
+- `GET/POST/DELETE /admin/admin-users`
+- `GET/POST/DELETE /admin/billing/prices`
+- `POST /admin/billing/topup`
+- `GET /admin/billing/txns`
+- `GET /admin/audit`
+
+Auth mode:
+
+- legacy: `X-Admin-Key`
+- token mode: `POST /admin/auth/login` then `Authorization: Bearer <token>`
+- optional HMAC guard: set `security.admin_hmac_secret` and pass
+  - `X-Admin-Ts: <unix_seconds>`
+  - `X-Admin-Sign: hex(hmac_sha256(secret, METHOD + "\n" + PATH + "\n" + TS))`
 
 ## Rule Context
 

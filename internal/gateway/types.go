@@ -12,6 +12,7 @@ type runtimeSnapshot struct {
 	keys      map[string]gatewayKey
 	rules     []ruleState
 	schedules []groupSchedule
+	priceDefaultMicros int64
 }
 
 type providerState struct {
@@ -41,6 +42,8 @@ type providerKeyState struct {
 type gatewayKey struct {
 	Key            string
 	Name           string
+	TenantName     string
+	BalanceMicros  int64
 	MaxRPM         int
 	MaxTPM         int
 	AllowedModels  []string

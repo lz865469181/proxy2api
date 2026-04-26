@@ -13,10 +13,14 @@ type Config struct {
 	Auth      AuthConfig     `yaml:"auth"`
 	DB        DBConfig       `yaml:"db"`
 	Redis     RedisConfig    `yaml:"redis"`
+	Billing   BillingConfig  `yaml:"billing"`
+	Security  SecurityConfig `yaml:"security"`
 	Gateway   GatewayConfig  `yaml:"gateway"`
 	Providers []Provider     `yaml:"providers"`
 	Keys      []APIKeyConfig `yaml:"keys"`
 	Rules     []RoutingRule  `yaml:"rules"`
+	Tenants   []TenantConfig `yaml:"tenants"`
+	Admins    []AdminConfig  `yaml:"admins"`
 }
 
 type ServerConfig struct {
@@ -25,6 +29,28 @@ type ServerConfig struct {
 
 type AuthConfig struct {
 	AdminKey string `yaml:"admin_key"`
+}
+
+type BillingConfig struct {
+	Enabled                      bool  `yaml:"enabled"`
+	DefaultPricePerMillionMicros int64 `yaml:"default_price_per_million_micros"`
+}
+
+type SecurityConfig struct {
+	AdminHMACSecret string   `yaml:"admin_hmac_secret"`
+	IPAllowlist     []string `yaml:"ip_allowlist"`
+	IPDenylist      []string `yaml:"ip_denylist"`
+}
+
+type TenantConfig struct {
+	Name    string `yaml:"name"`
+	Enabled bool   `yaml:"enabled"`
+}
+
+type AdminConfig struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	Role     string `yaml:"role"`
 }
 
 type DBConfig struct {
@@ -74,6 +100,8 @@ type Provider struct {
 type APIKeyConfig struct {
 	Key            string   `yaml:"key"`
 	Name           string   `yaml:"name"`
+	Tenant         string   `yaml:"tenant"`
+	BalanceMicros  int64    `yaml:"balance_micros"`
 	MaxRPM         int      `yaml:"max_rpm"`
 	MaxTPM         int      `yaml:"max_tpm"`
 	AllowedModels  []string `yaml:"allowed_models"`
@@ -143,6 +171,9 @@ func (c *Config) fillDefaults() {
 	if c.Redis.ReadTimeout <= 0 {
 		c.Redis.ReadTimeout = 2
 	}
+	if c.Billing.DefaultPricePerMillionMicros <= 0 {
+		c.Billing.DefaultPricePerMillionMicros = 200000
+	}
 	if c.Gateway.TimeoutSeconds <= 0 {
 		c.Gateway.TimeoutSeconds = 60
 	}
@@ -177,6 +208,15 @@ func (c *Config) fillDefaults() {
 		if c.Keys[i].RateMultiplier <= 0 {
 			c.Keys[i].RateMultiplier = 1
 		}
+		if c.Keys[i].Tenant == "" {
+			c.Keys[i].Tenant = "default"
+		}
+	}
+	if len(c.Tenants) == 0 {
+		c.Tenants = []TenantConfig{{Name: "default", Enabled: true}}
+	}
+	if len(c.Admins) == 0 {
+		c.Admins = []AdminConfig{{Username: "admin", Password: "admin123", Role: "owner"}}
 	}
 }
 

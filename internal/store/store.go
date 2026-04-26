@@ -1,6 +1,9 @@
 package store
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +56,8 @@ type APIKey struct {
 	ID             int64   `gorm:"primaryKey;autoIncrement"`
 	KeyValue       string  `gorm:"size:191;uniqueIndex;not null"`
 	Name           string  `gorm:"size:191;not null"`
+	TenantName     string  `gorm:"size:191;index;not null;default:'default'"`
+	BalanceMicros  int64   `gorm:"not null;default:0"`
 	MaxRPM         int     `gorm:"not null;default:0"`
 	MaxTPM         int     `gorm:"not null;default:0"`
 	AllowedModels  string  `gorm:"type:text;not null;default:'[]'"`
@@ -101,6 +106,52 @@ type UsageRecord struct {
 type KV struct {
 	K string `gorm:"primaryKey;size:191"`
 	V string `gorm:"type:text;not null"`
+}
+
+type Tenant struct {
+	ID        int64  `gorm:"primaryKey;autoIncrement"`
+	Name      string `gorm:"size:191;uniqueIndex;not null"`
+	Enabled   bool   `gorm:"not null;default:true"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type AdminUser struct {
+	ID           int64  `gorm:"primaryKey;autoIncrement"`
+	Username     string `gorm:"size:191;uniqueIndex;not null"`
+	PasswordHash string `gorm:"type:text;not null"`
+	Role         string `gorm:"size:32;not null;default:'viewer'"`
+	Token        string `gorm:"type:text;not null;default:''"`
+	Enabled      bool   `gorm:"not null;default:true"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+type PriceRule struct {
+	ID               int64  `gorm:"primaryKey;autoIncrement"`
+	ModelPrefix      string `gorm:"size:191;uniqueIndex;not null"`
+	PricePer1MMicros int64  `gorm:"not null;default:0"`
+	Enabled          bool   `gorm:"not null;default:true"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+type BillingTxn struct {
+	ID          int64  `gorm:"primaryKey;autoIncrement"`
+	APIKey      string `gorm:"size:191;index;not null"`
+	DeltaMicros int64  `gorm:"not null"`
+	Reason      string `gorm:"size:64;not null"`
+	Ref         string `gorm:"size:191;not null;default:''"`
+	CreatedAt   time.Time
+}
+
+type AuditLog struct {
+	ID         int64  `gorm:"primaryKey;autoIncrement"`
+	Actor      string `gorm:"size:191;index;not null"`
+	Action     string `gorm:"size:191;index;not null"`
+	Target     string `gorm:"size:191;not null;default:''"`
+	DetailJSON string `gorm:"type:text;not null;default:'{}'"`
+	CreatedAt  time.Time
 }
 
 type RuntimeConfigExport struct {
@@ -191,6 +242,11 @@ func (s *Store) migrate() error {
 		&GroupSchedule{},
 		&UsageRecord{},
 		&KV{},
+		&Tenant{},
+		&AdminUser{},
+		&PriceRule{},
+		&BillingTxn{},
+		&AuditLog{},
 	)
 }
 
@@ -265,6 +321,8 @@ func (s *Store) SeedFromConfig(cfg *config.Config) error {
 			if err := tx.Create(&APIKey{
 				KeyValue:       k.Key,
 				Name:           k.Name,
+				TenantName:     defaultStr(k.Tenant, "default"),
+				BalanceMicros:  k.BalanceMicros,
 				MaxRPM:         k.MaxRPM,
 				MaxTPM:         k.MaxTPM,
 				AllowedModels:  string(allowRaw),
@@ -273,6 +331,62 @@ func (s *Store) SeedFromConfig(cfg *config.Config) error {
 			}).Error; err != nil {
 				return err
 			}
+		}
+
+		insertedDefaultTenant := false
+		for _, t := range cfg.Tenants {
+			if strings.TrimSpace(t.Name) == "" {
+				continue
+			}
+			if t.Name == "default" {
+				insertedDefaultTenant = true
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "name"}},
+				DoUpdates: clause.AssignmentColumns([]string{"enabled"}),
+			}).Create(&Tenant{Name: t.Name, Enabled: t.Enabled}).Error; err != nil {
+				return err
+			}
+		}
+		if !insertedDefaultTenant {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "name"}},
+				DoUpdates: clause.AssignmentColumns([]string{"enabled"}),
+			}).Create(&Tenant{Name: "default", Enabled: true}).Error; err != nil {
+				return err
+			}
+		}
+
+		for _, a := range cfg.Admins {
+			if strings.TrimSpace(a.Username) == "" || strings.TrimSpace(a.Password) == "" {
+				continue
+			}
+			hash := sha256Hex(a.Password)
+			token := randomToken()
+			role := normalizeRole(a.Role)
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "username"}},
+				DoUpdates: clause.AssignmentColumns([]string{"password_hash", "role", "enabled"}),
+			}).Create(&AdminUser{
+				Username:     a.Username,
+				PasswordHash: hash,
+				Role:         role,
+				Token:        token,
+				Enabled:      true,
+			}).Error; err != nil {
+				return err
+			}
+		}
+
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "model_prefix"}},
+			DoUpdates: clause.AssignmentColumns([]string{"price_per1_m_micros", "enabled"}),
+		}).Create(&PriceRule{
+			ModelPrefix:      "*",
+			PricePer1MMicros: cfg.Billing.DefaultPricePerMillionMicros,
+			Enabled:          true,
+		}).Error; err != nil {
+			return err
 		}
 
 		for idx, r := range cfg.Rules {
@@ -450,6 +564,8 @@ func (s *Store) UpsertAPIKey(k APIKey) (int64, error) {
 		if err := s.db.Model(&APIKey{}).Where("id = ?", k.ID).Updates(map[string]any{
 			"key_value":       k.KeyValue,
 			"name":            k.Name,
+			"tenant_name":     defaultStr(k.TenantName, "default"),
+			"balance_micros":  k.BalanceMicros,
 			"max_rpm":         k.MaxRPM,
 			"max_tpm":         k.MaxTPM,
 			"allowed_models":  k.AllowedModels,
@@ -460,9 +576,12 @@ func (s *Store) UpsertAPIKey(k APIKey) (int64, error) {
 		}
 		return k.ID, nil
 	}
+	if k.TenantName == "" {
+		k.TenantName = "default"
+	}
 	if err := s.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "key_value"}},
-		DoUpdates: clause.AssignmentColumns([]string{"name", "max_rpm", "max_tpm", "allowed_models", "rate_multiplier", "enabled"}),
+		DoUpdates: clause.AssignmentColumns([]string{"name", "tenant_name", "balance_micros", "max_rpm", "max_tpm", "allowed_models", "rate_multiplier", "enabled"}),
 	}).Create(&k).Error; err != nil {
 		return 0, err
 	}
@@ -471,6 +590,63 @@ func (s *Store) UpsertAPIKey(k APIKey) (int64, error) {
 
 func (s *Store) DeleteAPIKey(id int64) error {
 	return s.db.Where("id = ?", id).Delete(&APIKey{}).Error
+}
+
+func (s *Store) FindAPIKeyByValue(key string) (APIKey, error) {
+	var k APIKey
+	err := s.db.Where("key_value = ?", key).First(&k).Error
+	return k, err
+}
+
+func (s *Store) TopupAPIKeyBalance(key string, deltaMicros int64, reason, ref string) error {
+	if deltaMicros == 0 {
+		return nil
+	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&APIKey{}).Where("key_value = ?", key).Update("balance_micros", gorm.Expr("balance_micros + ?", deltaMicros)).Error; err != nil {
+			return err
+		}
+		return tx.Create(&BillingTxn{
+			APIKey:      key,
+			DeltaMicros: deltaMicros,
+			Reason:      defaultStr(reason, "topup"),
+			Ref:         ref,
+		}).Error
+	})
+}
+
+func (s *Store) DeductAPIKeyBalance(key string, deltaMicros int64, reason, ref string) error {
+	if deltaMicros <= 0 {
+		return nil
+	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&APIKey{}).Where("key_value = ? AND balance_micros >= ?", key, deltaMicros).Update("balance_micros", gorm.Expr("balance_micros - ?", deltaMicros))
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errors.New("insufficient balance")
+		}
+		return tx.Create(&BillingTxn{
+			APIKey:      key,
+			DeltaMicros: -deltaMicros,
+			Reason:      defaultStr(reason, "usage"),
+			Ref:         ref,
+		}).Error
+	})
+}
+
+func (s *Store) ListBillingTxns(apiKey string, limit int) ([]BillingTxn, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	var out []BillingTxn
+	q := s.db.Order("id desc").Limit(limit)
+	if apiKey != "" {
+		q = q.Where("api_key = ?", apiKey)
+	}
+	err := q.Find(&out).Error
+	return out, err
 }
 
 func (s *Store) ListRules() ([]Rule, error) {
@@ -675,6 +851,205 @@ func (s *Store) ReplaceRulesAndSchedules(rules []Rule, schedules []GroupSchedule
 		}
 		return nil
 	})
+}
+
+func (s *Store) UpsertTenant(t Tenant) (int64, error) {
+	if strings.TrimSpace(t.Name) == "" {
+		return 0, errors.New("tenant name required")
+	}
+	if t.ID > 0 {
+		if err := s.db.Model(&Tenant{}).Where("id = ?", t.ID).Updates(map[string]any{
+			"name":    t.Name,
+			"enabled": t.Enabled,
+		}).Error; err != nil {
+			return 0, err
+		}
+		return t.ID, nil
+	}
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"enabled"}),
+	}).Create(&t).Error; err != nil {
+		return 0, err
+	}
+	return t.ID, nil
+}
+
+func (s *Store) ListTenants() ([]Tenant, error) {
+	var out []Tenant
+	err := s.db.Order("name asc").Find(&out).Error
+	return out, err
+}
+
+func (s *Store) DeleteTenant(id int64) error {
+	return s.db.Where("id = ?", id).Delete(&Tenant{}).Error
+}
+
+func (s *Store) IsTenantEnabled(name string) bool {
+	if name == "" {
+		name = "default"
+	}
+	var t Tenant
+	if err := s.db.Where("name = ?", name).First(&t).Error; err != nil {
+		if name == "default" {
+			return true
+		}
+		return false
+	}
+	return t.Enabled
+}
+
+func (s *Store) UpsertAdminUser(u AdminUser) (int64, error) {
+	if strings.TrimSpace(u.Username) == "" {
+		return 0, errors.New("username required")
+	}
+	u.Role = normalizeRole(u.Role)
+	if u.ID > 0 {
+		if err := s.db.Model(&AdminUser{}).Where("id = ?", u.ID).Updates(map[string]any{
+			"username":      u.Username,
+			"password_hash": u.PasswordHash,
+			"role":          u.Role,
+			"enabled":       u.Enabled,
+		}).Error; err != nil {
+			return 0, err
+		}
+		return u.ID, nil
+	}
+	if u.Token == "" {
+		u.Token = randomToken()
+	}
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "username"}},
+		DoUpdates: clause.AssignmentColumns([]string{"password_hash", "role", "enabled"}),
+	}).Create(&u).Error; err != nil {
+		return 0, err
+	}
+	return u.ID, nil
+}
+
+func (s *Store) ListAdminUsers() ([]AdminUser, error) {
+	var out []AdminUser
+	err := s.db.Order("id asc").Find(&out).Error
+	return out, err
+}
+
+func (s *Store) AdminLogin(username, password string) (AdminUser, error) {
+	var u AdminUser
+	if err := s.db.Where("username = ? AND enabled = ?", username, true).First(&u).Error; err != nil {
+		return AdminUser{}, err
+	}
+	if u.PasswordHash != sha256Hex(password) {
+		return AdminUser{}, errors.New("invalid username or password")
+	}
+	u.Token = randomToken()
+	if err := s.db.Model(&AdminUser{}).Where("id = ?", u.ID).Update("token", u.Token).Error; err != nil {
+		return AdminUser{}, err
+	}
+	return u, nil
+}
+
+func (s *Store) VerifyAdminToken(token string) (AdminUser, error) {
+	var u AdminUser
+	err := s.db.Where("token = ? AND enabled = ?", token, true).First(&u).Error
+	return u, err
+}
+
+func (s *Store) SetAdminEnabled(id int64, enabled bool) error {
+	return s.db.Model(&AdminUser{}).Where("id = ?", id).Update("enabled", enabled).Error
+}
+
+func (s *Store) UpsertPriceRule(p PriceRule) (int64, error) {
+	if strings.TrimSpace(p.ModelPrefix) == "" {
+		return 0, errors.New("model_prefix required")
+	}
+	if p.ID > 0 {
+		if err := s.db.Model(&PriceRule{}).Where("id = ?", p.ID).Updates(map[string]any{
+			"model_prefix":        p.ModelPrefix,
+			"price_per1_m_micros": p.PricePer1MMicros,
+			"enabled":             p.Enabled,
+		}).Error; err != nil {
+			return 0, err
+		}
+		return p.ID, nil
+	}
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "model_prefix"}},
+		DoUpdates: clause.AssignmentColumns([]string{"price_per1_m_micros", "enabled"}),
+	}).Create(&p).Error; err != nil {
+		return 0, err
+	}
+	return p.ID, nil
+}
+
+func (s *Store) ListPriceRules() ([]PriceRule, error) {
+	var out []PriceRule
+	err := s.db.Order("length(model_prefix) desc").Find(&out).Error
+	return out, err
+}
+
+func (s *Store) DeletePriceRule(id int64) error {
+	return s.db.Where("id = ?", id).Delete(&PriceRule{}).Error
+}
+
+func (s *Store) ResolveModelPriceMicros(model string, fallback int64) int64 {
+	var items []PriceRule
+	if err := s.db.Where("enabled = ?", true).Order("length(model_prefix) desc").Find(&items).Error; err != nil {
+		return fallback
+	}
+	for _, it := range items {
+		if it.ModelPrefix == "*" || strings.HasPrefix(model, it.ModelPrefix) {
+			return it.PricePer1MMicros
+		}
+	}
+	return fallback
+}
+
+func (s *Store) AddAudit(actor, action, target string, detail any) {
+	raw := "{}"
+	if detail != nil {
+		if b, err := json.Marshal(detail); err == nil {
+			raw = string(b)
+		}
+	}
+	_ = s.db.Create(&AuditLog{
+		Actor:      actor,
+		Action:     action,
+		Target:     target,
+		DetailJSON: raw,
+	}).Error
+}
+
+func (s *Store) ListAudit(limit int) ([]AuditLog, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	var out []AuditLog
+	err := s.db.Order("id desc").Limit(limit).Find(&out).Error
+	return out, err
+}
+
+func sha256Hex(v string) string {
+	sum := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(sum[:])
+}
+
+func randomToken() string {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("tok_%d", time.Now().UnixNano())
+	}
+	return "adm_" + hex.EncodeToString(b)
+}
+
+func normalizeRole(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "owner":
+		return "owner"
+	case "admin":
+		return "admin"
+	default:
+		return "viewer"
+	}
 }
 
 func defaultStr(v, d string) string {

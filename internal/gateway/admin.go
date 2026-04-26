@@ -1,12 +1,16 @@
 package gateway
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"proxy2api/internal/store"
 )
@@ -532,16 +536,22 @@ async function importConfig(){ const v=document.getElementById('cfgIn').value; t
 }
 
 func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
-	if s.cfg.Auth.AdminKey == "" {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin api disabled (missing admin_key)"})
+	if !s.verifyAdminHMAC(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin hmac verify failed"})
 		return false
 	}
 	got := strings.TrimSpace(r.Header.Get("X-Admin-Key"))
-	if got == "" || got != s.cfg.Auth.AdminKey {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin unauthorized"})
-		return false
+	if s.cfg.Auth.AdminKey != "" && got == s.cfg.Auth.AdminKey {
+		return true
 	}
-	return true
+	token := extractBearer(r.Header.Get("Authorization"))
+	if token != "" {
+		if _, err := s.store.VerifyAdminToken(token); err == nil {
+			return true
+		}
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin unauthorized"})
+	return false
 }
 
 func readIDQuery(r *http.Request) (int64, error) {
@@ -554,4 +564,364 @@ func readIDQuery(r *http.Request) (int64, error) {
 		return 0, fmt.Errorf("invalid id")
 	}
 	return id, nil
+}
+
+func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+		return
+	}
+	u, err := s.store.AdminLogin(strings.TrimSpace(req.Username), req.Password)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token": u.Token,
+		"role":  u.Role,
+	})
+}
+
+func (s *Server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.store.ListTenants()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"tenants": items})
+	case http.MethodPost:
+		if !s.requireAdminRole(w, r, "owner", "admin") {
+			return
+		}
+		var req struct {
+			ID      int64  `json:"id"`
+			Name    string `json:"name"`
+			Enabled bool   `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+			return
+		}
+		id, err := s.store.UpsertTenant(store.Tenant{ID: req.ID, Name: req.Name, Enabled: req.Enabled})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.store.AddAudit(s.adminActor(r), "tenant.upsert", req.Name, req)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id})
+	case http.MethodDelete:
+		if !s.requireAdminRole(w, r, "owner") {
+			return
+		}
+		id, err := readIDQuery(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.store.DeleteTenant(id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		s.store.AddAudit(s.adminActor(r), "tenant.delete", strconv.FormatInt(id, 10), nil)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.store.ListAdminUsers()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"admin_users": items})
+	case http.MethodPost:
+		if !s.requireAdminRole(w, r, "owner") {
+			return
+		}
+		var req struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Role     string `json:"role"`
+			Enabled  bool   `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+			return
+		}
+		id, err := s.store.UpsertAdminUser(store.AdminUser{
+			ID:           req.ID,
+			Username:     req.Username,
+			PasswordHash: hashPassword(req.Password),
+			Role:         req.Role,
+			Enabled:      req.Enabled,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.store.AddAudit(s.adminActor(r), "admin_user.upsert", req.Username, map[string]any{"role": req.Role, "enabled": req.Enabled})
+		writeJSON(w, http.StatusOK, map[string]any{"id": id})
+	case http.MethodDelete:
+		if !s.requireAdminRole(w, r, "owner") {
+			return
+		}
+		id, err := readIDQuery(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.store.SetAdminEnabled(id, false); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		s.store.AddAudit(s.adminActor(r), "admin_user.disable", strconv.FormatInt(id, 10), nil)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "disabled": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+func (s *Server) handleAdminBillingPrices(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.store.ListPriceRules()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"price_rules": items})
+	case http.MethodPost:
+		if !s.requireAdminRole(w, r, "owner", "admin") {
+			return
+		}
+		var req struct {
+			ID               int64  `json:"id"`
+			ModelPrefix      string `json:"model_prefix"`
+			PricePer1MMicros int64  `json:"price_per1m_micros"`
+			Enabled          bool   `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+			return
+		}
+		id, err := s.store.UpsertPriceRule(store.PriceRule{
+			ID:               req.ID,
+			ModelPrefix:      req.ModelPrefix,
+			PricePer1MMicros: req.PricePer1MMicros,
+			Enabled:          req.Enabled,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.store.AddAudit(s.adminActor(r), "price_rule.upsert", req.ModelPrefix, req)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id})
+	case http.MethodDelete:
+		if !s.requireAdminRole(w, r, "owner") {
+			return
+		}
+		id, err := readIDQuery(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.store.DeletePriceRule(id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		s.store.AddAudit(s.adminActor(r), "price_rule.delete", strconv.FormatInt(id, 10), nil)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+func (s *Server) handleAdminTopup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdminRole(w, r, "owner", "admin") {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req struct {
+		APIKey       string `json:"api_key"`
+		AmountMicros int64  `json:"amount_micros"`
+		Reason       string `json:"reason"`
+		Ref          string `json:"ref"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+		return
+	}
+	if req.AmountMicros <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "amount_micros must be positive"})
+		return
+	}
+	if err := s.store.TopupAPIKeyBalance(req.APIKey, req.AmountMicros, req.Reason, req.Ref); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	_ = s.reloadSnapshot()
+	s.store.AddAudit(s.adminActor(r), "billing.topup", req.APIKey, req)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleAdminBillingTxns(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	apiKey := strings.TrimSpace(r.URL.Query().Get("api_key"))
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil {
+			limit = v
+		}
+	}
+	items, err := s.store.ListBillingTxns(apiKey, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"billing_txns": items})
+}
+
+func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	limit := 200
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil {
+			limit = v
+		}
+	}
+	items, err := s.store.ListAudit(limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"audit_logs": items})
+}
+
+func (s *Server) requireAdminRole(w http.ResponseWriter, r *http.Request, roles ...string) bool {
+	role, ok := s.adminRole(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin unauthorized"})
+		return false
+	}
+	if len(roles) == 0 {
+		return true
+	}
+	for _, x := range roles {
+		if role == x {
+			return true
+		}
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient role"})
+	return false
+}
+
+func (s *Server) adminRole(r *http.Request) (string, bool) {
+	if strings.TrimSpace(r.Header.Get("X-Admin-Key")) == s.cfg.Auth.AdminKey && s.cfg.Auth.AdminKey != "" {
+		return "owner", true
+	}
+	token := extractBearer(r.Header.Get("Authorization"))
+	if token == "" {
+		return "", false
+	}
+	u, err := s.store.VerifyAdminToken(token)
+	if err != nil {
+		return "", false
+	}
+	return u.Role, true
+}
+
+func (s *Server) adminActor(r *http.Request) string {
+	if strings.TrimSpace(r.Header.Get("X-Admin-Key")) == s.cfg.Auth.AdminKey && s.cfg.Auth.AdminKey != "" {
+		return "admin_key"
+	}
+	token := extractBearer(r.Header.Get("Authorization"))
+	if token == "" {
+		return "anonymous"
+	}
+	u, err := s.store.VerifyAdminToken(token)
+	if err != nil {
+		return "token_unknown"
+	}
+	return "user:" + u.Username
+}
+
+func extractBearer(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	parts := strings.SplitN(v, " ", 2)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
+func hashPassword(pwd string) string {
+	sum := sha256.Sum256([]byte(pwd))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Server) verifyAdminHMAC(r *http.Request) bool {
+	secret := strings.TrimSpace(s.cfg.Security.AdminHMACSecret)
+	if secret == "" {
+		return true
+	}
+	ts := strings.TrimSpace(r.Header.Get("X-Admin-Ts"))
+	sign := strings.TrimSpace(r.Header.Get("X-Admin-Sign"))
+	if ts == "" || sign == "" {
+		return false
+	}
+	sec, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return false
+	}
+	now := time.Now().Unix()
+	if sec < now-300 || sec > now+300 {
+		return false
+	}
+	payload := r.Method + "\n" + r.URL.Path + "\n" + ts
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	expect := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(strings.ToLower(expect)), []byte(strings.ToLower(sign)))
 }

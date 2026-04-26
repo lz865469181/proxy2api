@@ -4,6 +4,17 @@ server:
 auth:
   admin_key: "change-me-admin-key"
 
+billing:
+  enabled: false
+  # default per 1M tokens in micros (1_000_000 micros = 1.0 currency unit)
+  default_price_per_million_micros: 200000
+
+security:
+  # optional: if set, admin APIs require X-Admin-Ts + X-Admin-Sign HMAC
+  admin_hmac_secret: ""
+  ip_allowlist: []
+  ip_denylist: []
+
 db:
   # sqlite | mysql | postgres
   driver: "sqlite"
@@ -34,6 +45,8 @@ gateway:
 keys:
   - key: "sk-user-demo"
     name: "demo-user"
+    tenant: "default"
+    balance_micros: 0
     max_rpm: 120
     max_tpm: 300000
     allowed_models: ["gpt-4o-mini", "gpt-4.1-mini", "claude-3-5-sonnet"]
@@ -41,6 +54,8 @@ keys:
 
   - key: "sk-enterprise"
     name: "enterprise"
+    tenant: "default"
+    balance_micros: 0
     max_rpm: 600
     max_tpm: 1500000
     allowed_models: []
@@ -103,3 +118,12 @@ providers:
     group_name: "default"
     recover_interval_sec: 45
     enabled: false
+
+tenants:
+  - name: "default"
+    enabled: true
+
+admins:
+  - username: "admin"
+    password: "admin123"
+    role: "owner"

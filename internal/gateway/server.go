@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
@@ -81,10 +82,20 @@ func NewServer(cfg *config.Config, st *store.Store) (*Server, error) {
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/", s.handleProxy)
+	mux.HandleFunc("/anthropic/v1/messages", s.handleAnthropicCompat)
+	mux.HandleFunc("/gemini/v1beta/", s.handleGeminiCompat)
+	mux.HandleFunc("/gemini/v1/", s.handleGeminiCompat)
+	mux.HandleFunc("/admin/auth/login", s.handleAdminLogin)
 	mux.HandleFunc("/admin/providers", s.handleAdminProviders)
 	mux.HandleFunc("/admin/providers/", s.handleAdminProviderAction)
 	mux.HandleFunc("/admin/provider-keys", s.handleAdminProviderKeys)
 	mux.HandleFunc("/admin/api-keys", s.handleAdminAPIKeys)
+	mux.HandleFunc("/admin/tenants", s.handleAdminTenants)
+	mux.HandleFunc("/admin/admin-users", s.handleAdminUsers)
+	mux.HandleFunc("/admin/billing/prices", s.handleAdminBillingPrices)
+	mux.HandleFunc("/admin/billing/topup", s.handleAdminTopup)
+	mux.HandleFunc("/admin/billing/txns", s.handleAdminBillingTxns)
+	mux.HandleFunc("/admin/audit", s.handleAdminAudit)
 	mux.HandleFunc("/admin/rules", s.handleAdminRules)
 	mux.HandleFunc("/admin/schedules", s.handleAdminSchedules)
 	mux.HandleFunc("/admin/config/export", s.handleAdminConfigExport)
@@ -95,7 +106,7 @@ func NewServer(cfg *config.Config, st *store.Store) (*Server, error) {
 
 	s.httpServer = &http.Server{
 		Addr:    cfg.Server.Listen,
-		Handler: withRecover(withMetrics(withAccessLog(mux))),
+		Handler: withRecover(withIPFilter(cfg.Security, withMetrics(withAccessLog(mux)))),
 	}
 	return s, nil
 }
@@ -200,6 +211,8 @@ func (s *Server) reloadSnapshot() error {
 		snap.keys[k.KeyValue] = gatewayKey{
 			Key:            k.KeyValue,
 			Name:           k.Name,
+			TenantName:     k.TenantName,
+			BalanceMicros:  k.BalanceMicros,
 			MaxRPM:         k.MaxRPM,
 			MaxTPM:         k.MaxTPM,
 			AllowedModels:  allow,
@@ -310,6 +323,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if estimatedToken <= 0 {
 		estimatedToken = 1
 	}
+	if s.cfg.Billing.Enabled {
+		price := s.store.ResolveModelPriceMicros(reqInfo.Model, s.cfg.Billing.DefaultPricePerMillionMicros)
+		estimatedCost := int64(estimatedToken) * price / 1_000_000
+		if estimatedCost > 0 {
+			live, err := s.store.FindAPIKeyByValue(userToken)
+			if err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "api key not found"})
+				return
+			}
+			if live.BalanceMicros < estimatedCost {
+				writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "insufficient balance"})
+				return
+			}
+		}
+	}
 
 	if !s.userLimiter.Allow("user:"+keyCfg.Key, 1, estimatedToken, keyCfg.MaxRPM, keyCfg.MaxTPM) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "user rate limit exceeded"})
@@ -348,6 +376,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.markProviderKeySuccess(providerKey)
+	chargedMicros := int64(0)
+	if s.cfg.Billing.Enabled {
+		price := s.store.ResolveModelPriceMicros(reqInfo.Model, s.cfg.Billing.DefaultPricePerMillionMicros)
+		actualTokens := max(estimatedToken, respUsage.Total)
+		chargedMicros = int64(actualTokens) * price / 1_000_000
+		if chargedMicros > 0 {
+			if err := s.store.DeductAPIKeyBalance(userToken, chargedMicros, "usage", reqInfo.Model); err != nil {
+				log.Printf("billing deduct failed key=%s err=%v", userToken, err)
+			}
+			_ = s.reloadSnapshot()
+		}
+	}
 	_ = s.store.AddUsage(store.UsageRecord{
 		AtUnix:           time.Now().Unix(),
 		APIKey:           userToken,
@@ -359,6 +399,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:      max(estimatedToken, respUsage.Total),
 	})
 	s.incStat("proxy_ok")
+	if chargedMicros > 0 {
+		s.incStat("billing_charged")
+	}
 }
 
 type usage struct {
@@ -426,7 +469,155 @@ func (s *Server) authenticateUser(r *http.Request) (string, gatewayKey, error) {
 	if !ok || !k.Enabled {
 		return "", gatewayKey{}, errors.New("invalid api key")
 	}
+	if !s.store.IsTenantEnabled(k.TenantName) {
+		return "", gatewayKey{}, errors.New("tenant disabled")
+	}
 	return key, k, nil
+}
+
+func (s *Server) handleAnthropicCompat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req struct {
+		Model     string `json:"model"`
+		MaxTokens int    `json:"max_tokens"`
+		Messages  []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	_ = json.Unmarshal(body, &req)
+	openaiReq := map[string]any{
+		"model":      req.Model,
+		"max_tokens": req.MaxTokens,
+		"messages":   req.Messages,
+	}
+	raw, _ := json.Marshal(openaiReq)
+
+	rc := httptest.NewRecorder()
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = "/v1/chat/completions"
+	r2.Body = io.NopCloser(bytes.NewReader(raw))
+	r2.ContentLength = int64(len(raw))
+	s.handleProxy(rc, r2)
+
+	if rc.Code >= 400 {
+		for k, v := range rc.Header() {
+			for _, vv := range v {
+				w.Header().Add(k, vv)
+			}
+		}
+		w.WriteHeader(rc.Code)
+		_, _ = w.Write(rc.Body.Bytes())
+		return
+	}
+
+	var oai map[string]any
+	_ = json.Unmarshal(rc.Body.Bytes(), &oai)
+	text := ""
+	if choices, ok := oai["choices"].([]any); ok && len(choices) > 0 {
+		if c0, ok := choices[0].(map[string]any); ok {
+			if msg, ok := c0["message"].(map[string]any); ok {
+				if v, ok := msg["content"].(string); ok {
+					text = v
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":    oai["id"],
+		"type":  "message",
+		"role":  "assistant",
+		"model": req.Model,
+		"content": []map[string]any{
+			{"type": "text", "text": text},
+		},
+		"usage": oai["usage"],
+	})
+}
+
+func (s *Server) handleGeminiCompat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req struct {
+		Contents []struct {
+			Role  string `json:"role"`
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"contents"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	_ = json.Unmarshal(body, &req)
+	model := "gemini-1.5-pro"
+	if i := strings.Index(r.URL.Path, "/models/"); i >= 0 {
+		rest := r.URL.Path[i+len("/models/"):]
+		if j := strings.Index(rest, ":"); j > 0 {
+			model = rest[:j]
+		}
+	}
+	msgs := make([]map[string]any, 0, len(req.Contents))
+	for _, c := range req.Contents {
+		text := ""
+		for _, p := range c.Parts {
+			if p.Text != "" {
+				if text != "" {
+					text += "\n"
+				}
+				text += p.Text
+			}
+		}
+		if text != "" {
+			role := c.Role
+			if role == "model" {
+				role = "assistant"
+			}
+			if role == "" {
+				role = "user"
+			}
+			msgs = append(msgs, map[string]any{"role": role, "content": text})
+		}
+	}
+	raw, _ := json.Marshal(map[string]any{"model": model, "messages": msgs})
+	rc := httptest.NewRecorder()
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = "/v1/chat/completions"
+	r2.Body = io.NopCloser(bytes.NewReader(raw))
+	r2.ContentLength = int64(len(raw))
+	s.handleProxy(rc, r2)
+	if rc.Code >= 400 {
+		for k, v := range rc.Header() {
+			for _, vv := range v {
+				w.Header().Add(k, vv)
+			}
+		}
+		w.WriteHeader(rc.Code)
+		_, _ = w.Write(rc.Body.Bytes())
+		return
+	}
+	var oai map[string]any
+	_ = json.Unmarshal(rc.Body.Bytes(), &oai)
+	text := ""
+	if choices, ok := oai["choices"].([]any); ok && len(choices) > 0 {
+		if c0, ok := choices[0].(map[string]any); ok {
+			if msg, ok := c0["message"].(map[string]any); ok {
+				if v, ok := msg["content"].(string); ok {
+					text = v
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"candidates": []map[string]any{
+			{"content": map[string]any{"role": "model", "parts": []map[string]any{{"text": text}}}},
+		},
+		"usageMetadata": oai["usage"],
+	})
 }
 
 func (s *Server) applyRules(apiKey, model, path string, multiplier *float64) (forceProvider string, denied bool) {
