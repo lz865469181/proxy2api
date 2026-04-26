@@ -5,6 +5,8 @@
 - `sub2api` style: account pool, sticky session, gateway controls.
 - `VoAPI` style: rule-driven routing, channel/group operations, runtime controls.
 
+Deferred enhancements are tracked in [`TODO.md`](./TODO.md).
+
 ## Implemented Capabilities
 
 - OpenAI-compatible ingress: `POST /v1/*`, `GET /v1/models`
@@ -32,6 +34,12 @@
 
 ```bash
 cp config/config.example.yaml config/config.yaml
+```
+
+Single-node recommended template:
+
+```bash
+cp config/config.single-node.yaml config/config.yaml
 ```
 
 2. Edit keys in `config/config.yaml`:

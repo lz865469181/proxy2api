@@ -1,0 +1,86 @@
+server:
+  listen: ":8080"
+
+auth:
+  # Keep this strong in production. Used as owner-level admin credential.
+  admin_key: "change-this-admin-key"
+
+billing:
+  # Recommended off for initial single-node deployment.
+  enabled: false
+  default_price_per_million_micros: 200000
+
+security:
+  # Optional HMAC hardening for admin APIs. Leave empty to disable.
+  admin_hmac_secret: ""
+  # Optional network ACL for single-node deployment.
+  ip_allowlist: []
+  ip_denylist: []
+
+db:
+  driver: "sqlite"
+  path: "data/proxy2api.db"
+  dsn: ""
+  max_open_conns: 20
+  max_idle_conns: 10
+  conn_max_lifetime_sec: 600
+
+redis:
+  # Single-node baseline: keep disabled.
+  enabled: false
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  key_prefix: "proxy2api:"
+  dial_timeout_seconds: 3
+  read_timeout_seconds: 2
+
+gateway:
+  timeout_seconds: 120
+  sticky_session_header: "session_id"
+  provider_fail_threshold: 3
+  provider_cooldown_seconds: 30
+  timezone: "Asia/Shanghai"
+  reload_seconds: 10
+
+keys:
+  - key: "sk-single-demo"
+    name: "single-demo"
+    tenant: "default"
+    balance_micros: 0
+    max_rpm: 120
+    max_tpm: 300000
+    allowed_models: ["gpt-4o-mini", "gpt-4.1-mini"]
+    rate_multiplier: 1.0
+
+rules:
+  - name: "block-exp-models"
+    match:
+      api_keys: []
+      model_prefix: "exp-"
+    action:
+      deny: true
+
+providers:
+  - name: "openai-main"
+    base_url: "https://api.openai.com"
+    upstream_keys:
+      - "replace-with-your-provider-key"
+    weight: 5
+    models: ["gpt-4o-mini", "gpt-4.1-mini"]
+    model_map: {}
+    max_rpm: 2000
+    max_tpm: 4000000
+    group_name: "default"
+    recover_interval_sec: 30
+    enabled: true
+
+tenants:
+  - name: "default"
+    enabled: true
+
+admins:
+  - username: "admin"
+    password: "admin123"
+    role: "owner"
+
