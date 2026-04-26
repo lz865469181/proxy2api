@@ -5,7 +5,23 @@ auth:
   admin_key: "change-me-admin-key"
 
 db:
+  # sqlite | mysql | postgres
+  driver: "sqlite"
   path: "data/proxy2api.db"
+  # when driver=mysql/postgres, use dsn and ignore path
+  dsn: ""
+  max_open_conns: 20
+  max_idle_conns: 10
+  conn_max_lifetime_sec: 600
+
+redis:
+  enabled: false
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  key_prefix: "proxy2api:"
+  dial_timeout_seconds: 3
+  read_timeout_seconds: 2
 
 gateway:
   timeout_seconds: 120

@@ -203,12 +203,32 @@ func TestAdminRuleCRUD(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpoint(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer up.Close()
+
+	s, ts := newTestGateway(t, testCfg(up.URL, nil))
+	defer ts.Close()
+	defer s.store.Close()
+
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
 func newTestGateway(t *testing.T, cfg *config.Config) (*Server, *httptest.Server) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "proxy2api-test.db")
 	cfg.DB.Path = dbPath
 
-	st, err := store.Open(dbPath)
+	st, err := store.Open(config.DBConfig{Driver: "sqlite", Path: dbPath})
 	if err != nil {
 		t.Fatalf("open store failed: %v", err)
 	}

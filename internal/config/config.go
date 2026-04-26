@@ -12,6 +12,7 @@ type Config struct {
 	Server    ServerConfig   `yaml:"server"`
 	Auth      AuthConfig     `yaml:"auth"`
 	DB        DBConfig       `yaml:"db"`
+	Redis     RedisConfig    `yaml:"redis"`
 	Gateway   GatewayConfig  `yaml:"gateway"`
 	Providers []Provider     `yaml:"providers"`
 	Keys      []APIKeyConfig `yaml:"keys"`
@@ -27,7 +28,22 @@ type AuthConfig struct {
 }
 
 type DBConfig struct {
-	Path string `yaml:"path"`
+	Driver             string `yaml:"driver"`
+	Path               string `yaml:"path"`
+	DSN                string `yaml:"dsn"`
+	MaxOpenConns       int    `yaml:"max_open_conns"`
+	MaxIdleConns       int    `yaml:"max_idle_conns"`
+	ConnMaxLifetimeSec int    `yaml:"conn_max_lifetime_sec"`
+}
+
+type RedisConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Addr        string `yaml:"addr"`
+	Password    string `yaml:"password"`
+	DB          int    `yaml:"db"`
+	KeyPrefix   string `yaml:"key_prefix"`
+	DialTimeout int    `yaml:"dial_timeout_seconds"`
+	ReadTimeout int    `yaml:"read_timeout_seconds"`
 }
 
 type GatewayConfig struct {
@@ -105,6 +121,27 @@ func (c *Config) fillDefaults() {
 	}
 	if c.DB.Path == "" {
 		c.DB.Path = "data/proxy2api.db"
+	}
+	if c.DB.Driver == "" {
+		c.DB.Driver = "sqlite"
+	}
+	if c.DB.MaxOpenConns <= 0 {
+		c.DB.MaxOpenConns = 20
+	}
+	if c.DB.MaxIdleConns <= 0 {
+		c.DB.MaxIdleConns = 10
+	}
+	if c.DB.ConnMaxLifetimeSec <= 0 {
+		c.DB.ConnMaxLifetimeSec = 600
+	}
+	if c.Redis.KeyPrefix == "" {
+		c.Redis.KeyPrefix = "proxy2api:"
+	}
+	if c.Redis.DialTimeout <= 0 {
+		c.Redis.DialTimeout = 3
+	}
+	if c.Redis.ReadTimeout <= 0 {
+		c.Redis.ReadTimeout = 2
 	}
 	if c.Gateway.TimeoutSeconds <= 0 {
 		c.Gateway.TimeoutSeconds = 60

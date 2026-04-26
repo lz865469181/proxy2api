@@ -19,10 +19,12 @@
   - `force_provider`
   - `rate_multiplier`
 - Group schedule multiplier (time-window based channel throttling multiplier)
-- Persistent config/state with SQLite
+- Persistent config/state with SQLite/MySQL/PostgreSQL
+- Redis distributed limiter (optional)
 - Usage record persistence and 24h summary
-- Admin APIs + minimal admin UI (`/admin/ui`)
+- Full web admin console (`/admin/ui`)
 - Runtime hot reload (periodic + manual)
+- Prometheus metrics endpoint (`/metrics`)
 
 ## Quick Start
 
@@ -37,6 +39,7 @@ cp config/config.example.yaml config/config.yaml
 - `auth.admin_key`
 - `keys[].key`
 - `providers[].upstream_keys[]`
+- DB and Redis section if needed
 
 3. Start:
 
@@ -45,6 +48,26 @@ go run ./cmd/proxy2api -config config/config.yaml
 ```
 
 Default listen: `:8080`.
+
+## Database Modes
+
+`db.driver` supports:
+
+- `sqlite` (default, local file path `db.path`)
+- `mysql` (use `db.dsn`)
+- `postgres` (use `db.dsn`)
+
+Example PostgreSQL DSN:
+
+```text
+host=127.0.0.1 user=proxy2api password=proxy2api dbname=proxy2api port=5432 sslmode=disable
+```
+
+Example MySQL DSN:
+
+```text
+proxy2api:proxy2api@tcp(127.0.0.1:3306)/proxy2api?parseTime=true&loc=Local
+```
 
 ## Docker Local Deployment
 
@@ -65,6 +88,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-config.ps1
 ```bash
 docker compose up -d --build
 ```
+
+Optional profiles:
+
+- PostgreSQL: `docker compose --profile postgres up -d --build`
+- MySQL: `docker compose --profile mysql up -d --build`
 
 4. Check status:
 
@@ -106,6 +134,7 @@ Public:
 - `GET /healthz`
 - `GET /v1/models`
 - `POST /v1/chat/completions` (or other `/v1/*`)
+- `GET /metrics`
 
 Admin (`X-Admin-Key` required):
 
@@ -125,6 +154,9 @@ Admin (`X-Admin-Key` required):
 - `DELETE /admin/schedules?id={id}`
 - `GET /admin/config/export`
 - `POST /admin/config/import`
+- `GET /admin/api-keys`
+- `POST /admin/api-keys`
+- `DELETE /admin/api-keys?id={id}`
 
 ## Rule Context
 

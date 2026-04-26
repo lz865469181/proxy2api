@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"proxy2api/internal/config"
 	"proxy2api/internal/store"
@@ -30,8 +31,8 @@ type Server struct {
 
 	snapshot atomicSnapshot
 
-	userLimiter    *minuteLimiter
-	channelLimiter *minuteLimiter
+	userLimiter    Limiter
+	channelLimiter Limiter
 
 	stickyMu      sync.Mutex
 	stickySession map[string]stickyBind
@@ -56,6 +57,20 @@ func NewServer(cfg *config.Config, st *store.Store) (*Server, error) {
 		stickySession:  make(map[string]stickyBind),
 		stats:          make(map[string]int64),
 	}
+	if cfg.Redis.Enabled && cfg.Redis.Addr != "" {
+		if rl, err := newRedisLimiter(cfg.Redis); err == nil {
+			s.userLimiter = rl
+			s.channelLimiter = rl
+			log.Printf("redis limiter enabled addr=%s", cfg.Redis.Addr)
+		} else {
+			log.Printf("redis limiter init failed, fallback to memory: %v", err)
+			s.userLimiter = newMinuteLimiter()
+			s.channelLimiter = newMinuteLimiter()
+		}
+	} else {
+		s.userLimiter = newMinuteLimiter()
+		s.channelLimiter = newMinuteLimiter()
+	}
 
 	if err := s.reloadSnapshot(); err != nil {
 		return nil, err
@@ -63,11 +78,13 @@ func NewServer(cfg *config.Config, st *store.Store) (*Server, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/", s.handleProxy)
 	mux.HandleFunc("/admin/providers", s.handleAdminProviders)
 	mux.HandleFunc("/admin/providers/", s.handleAdminProviderAction)
 	mux.HandleFunc("/admin/provider-keys", s.handleAdminProviderKeys)
+	mux.HandleFunc("/admin/api-keys", s.handleAdminAPIKeys)
 	mux.HandleFunc("/admin/rules", s.handleAdminRules)
 	mux.HandleFunc("/admin/schedules", s.handleAdminSchedules)
 	mux.HandleFunc("/admin/config/export", s.handleAdminConfigExport)
@@ -78,7 +95,7 @@ func NewServer(cfg *config.Config, st *store.Store) (*Server, error) {
 
 	s.httpServer = &http.Server{
 		Addr:    cfg.Server.Listen,
-		Handler: withRecover(mux),
+		Handler: withRecover(withMetrics(withAccessLog(mux))),
 	}
 	return s, nil
 }
@@ -294,7 +311,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		estimatedToken = 1
 	}
 
-	if !s.userLimiter.allow("user:"+keyCfg.Key, 1, estimatedToken, keyCfg.MaxRPM, keyCfg.MaxTPM) {
+	if !s.userLimiter.Allow("user:"+keyCfg.Key, 1, estimatedToken, keyCfg.MaxRPM, keyCfg.MaxTPM) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "user rate limit exceeded"})
 		return
 	}
@@ -316,7 +333,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	channelKey := "provider:" + provider.Name + ":" + providerKey.Alias
-	if !s.channelLimiter.allow(channelKey, 1, estimatedToken, effectiveProviderMaxRPM, effectiveProviderMaxTPM) {
+	if !s.channelLimiter.Allow(channelKey, 1, estimatedToken, effectiveProviderMaxRPM, effectiveProviderMaxTPM) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "provider rate limit exceeded"})
 		return
 	}

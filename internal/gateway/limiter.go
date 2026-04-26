@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+type Limiter interface {
+	Allow(key string, reqDelta, tokDelta, maxReq, maxTok int) bool
+}
+
 type minuteBucket struct {
 	windowStart time.Time
 	reqCount    int
@@ -22,7 +26,7 @@ func newMinuteLimiter() *minuteLimiter {
 	}
 }
 
-func (l *minuteLimiter) allow(key string, reqDelta, tokDelta, maxReq, maxTok int) bool {
+func (l *minuteLimiter) Allow(key string, reqDelta, tokDelta, maxReq, maxTok int) bool {
 	if maxReq <= 0 && maxTok <= 0 {
 		return true
 	}

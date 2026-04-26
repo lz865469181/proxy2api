@@ -1,86 +1,106 @@
 package store
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/glebarez/sqlite"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"proxy2api/internal/config"
 )
 
 type Store struct {
-	db *sql.DB
+	db *gorm.DB
 }
 
 type Provider struct {
-	ID                 int64
-	Name               string
-	BaseURL            string
-	Weight             int
-	ModelsJSON         string
-	ModelMapJSON       string
-	MaxRPM             int
-	MaxTPM             int
-	Enabled            bool
-	GroupName          string
-	RecoverIntervalSec int
+	ID                 int64  `gorm:"primaryKey;autoIncrement"`
+	Name               string `gorm:"size:191;uniqueIndex;not null"`
+	BaseURL            string `gorm:"type:text;not null"`
+	Weight             int    `gorm:"not null;default:1"`
+	ModelsJSON         string `gorm:"type:text;not null;default:'[]'"`
+	ModelMapJSON       string `gorm:"type:text;not null;default:'{}'"`
+	MaxRPM             int    `gorm:"not null;default:0"`
+	MaxTPM             int    `gorm:"not null;default:0"`
+	Enabled            bool   `gorm:"not null;default:true"`
+	GroupName          string `gorm:"size:191;not null;default:'default'"`
+	RecoverIntervalSec int    `gorm:"not null;default:60"`
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type ProviderKey struct {
-	ID              int64
-	ProviderName    string
-	Alias           string
-	APIKey          string
-	Enabled         bool
-	ConsecutiveErrs int
-	CooldownUntil   int64
-	LastStatus      string
+	ID              int64  `gorm:"primaryKey;autoIncrement"`
+	ProviderName    string `gorm:"size:191;index;not null"`
+	Alias           string `gorm:"size:191;not null"`
+	APIKey          string `gorm:"type:text;not null"`
+	Enabled         bool   `gorm:"not null;default:true"`
+	ConsecutiveErrs int    `gorm:"not null;default:0"`
+	CooldownUntil   int64  `gorm:"not null;default:0"`
+	LastStatus      string `gorm:"type:text;not null;default:''"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type APIKey struct {
-	ID             int64
-	KeyValue       string
-	Name           string
-	MaxRPM         int
-	MaxTPM         int
-	AllowedModels  string
-	RateMultiplier float64
-	Enabled        bool
+	ID             int64   `gorm:"primaryKey;autoIncrement"`
+	KeyValue       string  `gorm:"size:191;uniqueIndex;not null"`
+	Name           string  `gorm:"size:191;not null"`
+	MaxRPM         int     `gorm:"not null;default:0"`
+	MaxTPM         int     `gorm:"not null;default:0"`
+	AllowedModels  string  `gorm:"type:text;not null;default:'[]'"`
+	RateMultiplier float64 `gorm:"not null;default:1.0"`
+	Enabled        bool    `gorm:"not null;default:true"`
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type Rule struct {
-	ID          int64
-	Name        string
-	Priority    int
-	Enabled     bool
-	ConditionJS string
-	ActionJSON  string
+	ID          int64  `gorm:"primaryKey;autoIncrement"`
+	Name        string `gorm:"size:191;uniqueIndex;not null"`
+	Priority    int    `gorm:"not null;default:100"`
+	Enabled     bool   `gorm:"not null;default:true"`
+	ConditionJS string `gorm:"type:text;not null"`
+	ActionJSON  string `gorm:"type:text;not null"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 type GroupSchedule struct {
-	ID          int64
-	GroupName   string
-	WeekdayMask string
-	StartHHMM   string
-	EndHHMM     string
-	Multiplier  float64
-	Enabled     bool
+	ID          int64   `gorm:"primaryKey;autoIncrement"`
+	GroupName   string  `gorm:"size:191;index;not null"`
+	WeekdayMask string  `gorm:"size:64;not null;default:'1,2,3,4,5,6,7'"`
+	StartHHMM   string  `gorm:"size:8;not null;default:'00:00'"`
+	EndHHMM     string  `gorm:"size:8;not null;default:'23:59'"`
+	Multiplier  float64 `gorm:"not null;default:1.0"`
+	Enabled     bool    `gorm:"not null;default:true"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 type UsageRecord struct {
-	AtUnix           int64
-	APIKey           string
-	Provider         string
-	ProviderKey      string
-	Model            string
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
+	ID               int64  `gorm:"primaryKey;autoIncrement"`
+	AtUnix           int64  `gorm:"index;not null"`
+	APIKey           string `gorm:"size:191;index;not null"`
+	Provider         string `gorm:"size:191;index;not null"`
+	ProviderKey      string `gorm:"size:191;index;not null"`
+	Model            string `gorm:"size:191;index;not null"`
+	PromptTokens     int    `gorm:"not null;default:0"`
+	CompletionTokens int    `gorm:"not null;default:0"`
+	TotalTokens      int    `gorm:"not null;default:0"`
+	CreatedAt        time.Time
+}
+
+type KV struct {
+	K string `gorm:"primaryKey;size:191"`
+	V string `gorm:"type:text;not null"`
 }
 
 type RuntimeConfigExport struct {
@@ -91,194 +111,192 @@ type RuntimeConfigExport struct {
 	Schedules    []GroupSchedule `json:"schedules"`
 }
 
-func Open(path string) (*Store, error) {
-	if path == "" {
-		return nil, errors.New("db path cannot be empty")
+func (ProviderKey) TableName() string {
+	return "provider_keys"
+}
+func (APIKey) TableName() string {
+	return "api_keys"
+}
+func (GroupSchedule) TableName() string {
+	return "group_schedules"
+}
+func (UsageRecord) TableName() string {
+	return "usage_records"
+}
+
+func Open(cfg config.DBConfig) (*Store, error) {
+	driver := strings.ToLower(strings.TrimSpace(cfg.Driver))
+	if driver == "" {
+		driver = "sqlite"
 	}
-	if err := os.MkdirAll(dir(path), 0o755); err != nil {
-		return nil, err
+
+	var (
+		db  *gorm.DB
+		err error
+	)
+	switch driver {
+	case "sqlite":
+		path := cfg.Path
+		if path == "" {
+			path = "data/proxy2api.db"
+		}
+		db, err = gorm.Open(sqlite.Open(path), &gorm.Config{})
+	case "mysql":
+		if cfg.DSN == "" {
+			return nil, errors.New("db.dsn is required for mysql")
+		}
+		db, err = gorm.Open(mysql.Open(cfg.DSN), &gorm.Config{})
+	case "postgres", "postgresql":
+		if cfg.DSN == "" {
+			return nil, errors.New("db.dsn is required for postgres")
+		}
+		db, err = gorm.Open(postgres.Open(cfg.DSN), &gorm.Config{})
+	default:
+		return nil, fmt.Errorf("unsupported db driver: %s", cfg.Driver)
 	}
-	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.MaxOpenConns > 0 {
+		sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns > 0 {
+		sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if cfg.ConnMaxLifetimeSec > 0 {
+		sqlDB.SetConnMaxLifetime(time.Duration(cfg.ConnMaxLifetimeSec) * time.Second)
+	}
+
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
-		_ = db.Close()
+		return nil, err
+	}
+	if err := s.ensureIndexes(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) Close() error {
-	return s.db.Close()
+func (s *Store) migrate() error {
+	return s.db.AutoMigrate(
+		&Provider{},
+		&ProviderKey{},
+		&APIKey{},
+		&Rule{},
+		&GroupSchedule{},
+		&UsageRecord{},
+		&KV{},
+	)
 }
 
-func (s *Store) migrate() error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS providers (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL UNIQUE,
-			base_url TEXT NOT NULL,
-			weight INTEGER NOT NULL DEFAULT 1,
-			models_json TEXT NOT NULL DEFAULT '[]',
-			model_map_json TEXT NOT NULL DEFAULT '{}',
-			max_rpm INTEGER NOT NULL DEFAULT 0,
-			max_tpm INTEGER NOT NULL DEFAULT 0,
-			enabled INTEGER NOT NULL DEFAULT 1,
-			group_name TEXT NOT NULL DEFAULT 'default',
-			recover_interval_sec INTEGER NOT NULL DEFAULT 60
-		);`,
-		`CREATE TABLE IF NOT EXISTS provider_keys (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			provider_name TEXT NOT NULL,
-			alias TEXT NOT NULL,
-			api_key TEXT NOT NULL,
-			enabled INTEGER NOT NULL DEFAULT 1,
-			consecutive_errs INTEGER NOT NULL DEFAULT 0,
-			cooldown_until INTEGER NOT NULL DEFAULT 0,
-			last_status TEXT NOT NULL DEFAULT '',
-			UNIQUE(provider_name, alias)
-		);`,
-		`CREATE TABLE IF NOT EXISTS api_keys (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			key_value TEXT NOT NULL UNIQUE,
-			name TEXT NOT NULL,
-			max_rpm INTEGER NOT NULL DEFAULT 0,
-			max_tpm INTEGER NOT NULL DEFAULT 0,
-			allowed_models_json TEXT NOT NULL DEFAULT '[]',
-			rate_multiplier REAL NOT NULL DEFAULT 1.0,
-			enabled INTEGER NOT NULL DEFAULT 1
-		);`,
-		`CREATE TABLE IF NOT EXISTS rules (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL UNIQUE,
-			priority INTEGER NOT NULL DEFAULT 100,
-			enabled INTEGER NOT NULL DEFAULT 1,
-			condition_js TEXT NOT NULL,
-			action_json TEXT NOT NULL
-		);`,
-		`CREATE TABLE IF NOT EXISTS group_schedules (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			group_name TEXT NOT NULL,
-			weekday_mask TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7',
-			start_hhmm TEXT NOT NULL DEFAULT '00:00',
-			end_hhmm TEXT NOT NULL DEFAULT '23:59',
-			multiplier REAL NOT NULL DEFAULT 1.0,
-			enabled INTEGER NOT NULL DEFAULT 1
-		);`,
-		`CREATE TABLE IF NOT EXISTS usage_records (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			at_unix INTEGER NOT NULL,
-			api_key TEXT NOT NULL,
-			provider TEXT NOT NULL,
-			provider_key TEXT NOT NULL,
-			model TEXT NOT NULL,
-			prompt_tokens INTEGER NOT NULL DEFAULT 0,
-			completion_tokens INTEGER NOT NULL DEFAULT 0,
-			total_tokens INTEGER NOT NULL DEFAULT 0
-		);`,
-		`CREATE TABLE IF NOT EXISTS kv (
-			k TEXT PRIMARY KEY,
-			v TEXT NOT NULL
-		);`,
+func (s *Store) ensureIndexes() error {
+	return s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_provider_keys_provider_alias ON provider_keys(provider_name, alias)`).Error
+}
+
+func (s *Store) Close() error {
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return err
 	}
-	for _, stmt := range stmts {
-		if _, err := s.db.Exec(stmt); err != nil {
-			return err
-		}
-	}
-	return nil
+	return sqlDB.Close()
 }
 
 func (s *Store) SeedFromConfig(cfg *config.Config) error {
-	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM providers`).Scan(&n); err != nil {
+	var n int64
+	if err := s.db.Model(&Provider{}).Count(&n).Error; err != nil {
 		return err
 	}
 	if n > 0 {
 		return nil
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		for _, p := range cfg.Providers {
+			modelsRaw, _ := json.Marshal(p.Models)
+			modelMapRaw, _ := json.Marshal(p.ModelMap)
+			provider := Provider{
+				Name:               p.Name,
+				BaseURL:            p.BaseURL,
+				Weight:             p.Weight,
+				ModelsJSON:         string(modelsRaw),
+				ModelMapJSON:       string(modelMapRaw),
+				MaxRPM:             p.MaxRPM,
+				MaxTPM:             p.MaxTPM,
+				Enabled:            p.Enabled,
+				GroupName:          defaultStr(p.GroupName, "default"),
+				RecoverIntervalSec: max(1, p.RecoverIntervalSec),
+			}
+			if err := tx.Create(&provider).Error; err != nil {
+				return err
+			}
 
-	for _, p := range cfg.Providers {
-		modelsRaw, _ := json.Marshal(p.Models)
-		modelMapRaw, _ := json.Marshal(p.ModelMap)
-		groupName := "default"
-		if p.GroupName != "" {
-			groupName = p.GroupName
-		}
-		_, err = tx.Exec(
-			`INSERT INTO providers(name, base_url, weight, models_json, model_map_json, max_rpm, max_tpm, enabled, group_name, recover_interval_sec)
-			 VALUES(?,?,?,?,?,?,?,?,?,?)`,
-			p.Name, p.BaseURL, p.Weight, string(modelsRaw), string(modelMapRaw),
-			p.MaxRPM, p.MaxTPM, boolToInt(p.Enabled), groupName, max(1, p.RecoverIntervalSec),
-		)
-		if err != nil {
-			return err
+			if len(p.UpstreamKeys) == 0 && p.APIKey != "" {
+				if err := tx.Create(&ProviderKey{
+					ProviderName: p.Name,
+					Alias:        "primary",
+					APIKey:       p.APIKey,
+					Enabled:      true,
+				}).Error; err != nil {
+					return err
+				}
+			}
+			for i, k := range p.UpstreamKeys {
+				if strings.TrimSpace(k) == "" {
+					continue
+				}
+				if err := tx.Create(&ProviderKey{
+					ProviderName: p.Name,
+					Alias:        fmt.Sprintf("k%d", i+1),
+					APIKey:       k,
+					Enabled:      true,
+				}).Error; err != nil {
+					return err
+				}
+			}
 		}
 
-		if len(p.UpstreamKeys) == 0 && p.APIKey != "" {
-			_, err = tx.Exec(
-				`INSERT INTO provider_keys(provider_name, alias, api_key, enabled) VALUES(?,?,?,1)`,
-				p.Name, "primary", p.APIKey,
-			)
-			if err != nil {
+		for _, k := range cfg.Keys {
+			allowRaw, _ := json.Marshal(k.AllowedModels)
+			if err := tx.Create(&APIKey{
+				KeyValue:       k.Key,
+				Name:           k.Name,
+				MaxRPM:         k.MaxRPM,
+				MaxTPM:         k.MaxTPM,
+				AllowedModels:  string(allowRaw),
+				RateMultiplier: k.RateMultiplier,
+				Enabled:        true,
+			}).Error; err != nil {
 				return err
 			}
 		}
-		for i, k := range p.UpstreamKeys {
-			if k == "" {
-				continue
-			}
-			_, err = tx.Exec(
-				`INSERT INTO provider_keys(provider_name, alias, api_key, enabled) VALUES(?,?,?,1)`,
-				p.Name, fmt.Sprintf("k%d", i+1), k,
-			)
-			if err != nil {
+
+		for idx, r := range cfg.Rules {
+			actionRaw, _ := json.Marshal(r.Action)
+			cond := buildConditionJS(r)
+			if err := tx.Create(&Rule{
+				Name:        r.Name,
+				Priority:    idx + 1,
+				Enabled:     true,
+				ConditionJS: cond,
+				ActionJSON:  string(actionRaw),
+			}).Error; err != nil {
 				return err
 			}
 		}
-	}
 
-	for _, k := range cfg.Keys {
-		allowedRaw, _ := json.Marshal(k.AllowedModels)
-		_, err = tx.Exec(
-			`INSERT INTO api_keys(key_value, name, max_rpm, max_tpm, allowed_models_json, rate_multiplier, enabled)
-			 VALUES(?,?,?,?,?,?,1)`,
-			k.Key, k.Name, k.MaxRPM, k.MaxTPM, string(allowedRaw), k.RateMultiplier,
-		)
-		if err != nil {
-			return err
-		}
-	}
-
-	for idx, rule := range cfg.Rules {
-		actionRaw, _ := json.Marshal(rule.Action)
-		cond := buildConditionJS(rule)
-		_, err = tx.Exec(
-			`INSERT INTO rules(name, priority, enabled, condition_js, action_json) VALUES(?,?,?,?,?)`,
-			rule.Name, idx+1, 1, cond, string(actionRaw),
-		)
-		if err != nil {
-			return err
-		}
-	}
-
-	if _, err = tx.Exec(`INSERT OR REPLACE INTO kv(k,v) VALUES('seeded_at',?)`, time.Now().UTC().Format(time.RFC3339)); err != nil {
-		return err
-	}
-	return tx.Commit()
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "k"}},
+			DoUpdates: clause.AssignmentColumns([]string{"v"}),
+		}).Create(&KV{
+			K: "seeded_at",
+			V: time.Now().UTC().Format(time.RFC3339),
+		}).Error
+	})
 }
 
 func buildConditionJS(rule config.RoutingRule) string {
@@ -300,102 +318,165 @@ func buildConditionJS(rule config.RoutingRule) string {
 }
 
 func (s *Store) ListProviders() ([]Provider, error) {
-	rows, err := s.db.Query(`SELECT id,name,base_url,weight,models_json,model_map_json,max_rpm,max_tpm,enabled,group_name,recover_interval_sec FROM providers ORDER BY name`)
-	if err != nil {
-		return nil, err
+	var out []Provider
+	err := s.db.Order("name").Find(&out).Error
+	return out, err
+}
+
+func (s *Store) UpsertProvider(p Provider) error {
+	if strings.TrimSpace(p.Name) == "" {
+		return errors.New("provider name is required")
 	}
-	defer rows.Close()
-	out := make([]Provider, 0)
-	for rows.Next() {
-		var p Provider
-		var enabled int
-		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &p.Weight, &p.ModelsJSON, &p.ModelMapJSON, &p.MaxRPM, &p.MaxTPM, &enabled, &p.GroupName, &p.RecoverIntervalSec); err != nil {
-			return nil, err
+	if strings.TrimSpace(p.BaseURL) == "" {
+		return errors.New("provider base_url is required")
+	}
+	if p.Weight <= 0 {
+		p.Weight = 1
+	}
+	if p.GroupName == "" {
+		p.GroupName = "default"
+	}
+	if p.RecoverIntervalSec <= 0 {
+		p.RecoverIntervalSec = 60
+	}
+
+	if p.ID > 0 {
+		return s.db.Model(&Provider{}).Where("id = ?", p.ID).Updates(map[string]any{
+			"name":                 p.Name,
+			"base_url":             p.BaseURL,
+			"weight":               p.Weight,
+			"models_json":          p.ModelsJSON,
+			"model_map_json":       p.ModelMapJSON,
+			"max_rpm":              p.MaxRPM,
+			"max_tpm":              p.MaxTPM,
+			"enabled":              p.Enabled,
+			"group_name":           p.GroupName,
+			"recover_interval_sec": p.RecoverIntervalSec,
+		}).Error
+	}
+	return s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"base_url", "weight", "models_json", "model_map_json", "max_rpm", "max_tpm", "enabled", "group_name", "recover_interval_sec"}),
+	}).Create(&p).Error
+}
+
+func (s *Store) DeleteProvider(name string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("provider_name = ?", name).Delete(&ProviderKey{}).Error; err != nil {
+			return err
 		}
-		p.Enabled = enabled == 1
-		out = append(out, p)
-	}
-	return out, rows.Err()
+		return tx.Where("name = ?", name).Delete(&Provider{}).Error
+	})
 }
 
 func (s *Store) SetProviderEnabled(name string, enabled bool) error {
-	_, err := s.db.Exec(`UPDATE providers SET enabled=? WHERE name=?`, boolToInt(enabled), name)
-	return err
+	return s.db.Model(&Provider{}).Where("name = ?", name).Update("enabled", enabled).Error
 }
 
 func (s *Store) ListProviderKeys(providerName string) ([]ProviderKey, error) {
-	query := `SELECT id,provider_name,alias,api_key,enabled,consecutive_errs,cooldown_until,last_status FROM provider_keys`
-	args := []any{}
+	var out []ProviderKey
+	q := s.db.Order("provider_name, id")
 	if providerName != "" {
-		query += ` WHERE provider_name=?`
-		args = append(args, providerName)
+		q = q.Where("provider_name = ?", providerName)
 	}
-	query += ` ORDER BY provider_name, id`
+	err := q.Find(&out).Error
+	return out, err
+}
 
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
+func (s *Store) UpsertProviderKey(k ProviderKey) (int64, error) {
+	if strings.TrimSpace(k.ProviderName) == "" {
+		return 0, errors.New("provider_name is required")
 	}
-	defer rows.Close()
-	out := make([]ProviderKey, 0)
-	for rows.Next() {
-		var x ProviderKey
-		var enabled int
-		if err := rows.Scan(&x.ID, &x.ProviderName, &x.Alias, &x.APIKey, &enabled, &x.ConsecutiveErrs, &x.CooldownUntil, &x.LastStatus); err != nil {
-			return nil, err
+	if strings.TrimSpace(k.Alias) == "" {
+		return 0, errors.New("alias is required")
+	}
+	if strings.TrimSpace(k.APIKey) == "" {
+		return 0, errors.New("api_key is required")
+	}
+	if k.ID > 0 {
+		if err := s.db.Model(&ProviderKey{}).Where("id = ?", k.ID).Updates(map[string]any{
+			"provider_name": k.ProviderName,
+			"alias":         k.Alias,
+			"api_key":       k.APIKey,
+			"enabled":       k.Enabled,
+		}).Error; err != nil {
+			return 0, err
 		}
-		x.Enabled = enabled == 1
-		out = append(out, x)
+		return k.ID, nil
 	}
-	return out, rows.Err()
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "provider_name"}, {Name: "alias"}},
+		DoUpdates: clause.AssignmentColumns([]string{"api_key", "enabled"}),
+	}).Create(&k).Error; err != nil {
+		return 0, err
+	}
+	return k.ID, nil
+}
+
+func (s *Store) DeleteProviderKey(id int64) error {
+	return s.db.Where("id = ?", id).Delete(&ProviderKey{}).Error
 }
 
 func (s *Store) UpdateProviderKeyHealth(id int64, consecutiveErrs int, cooldownUntil int64, lastStatus string) error {
-	_, err := s.db.Exec(`UPDATE provider_keys SET consecutive_errs=?, cooldown_until=?, last_status=? WHERE id=?`, consecutiveErrs, cooldownUntil, lastStatus, id)
-	return err
+	return s.db.Model(&ProviderKey{}).Where("id = ?", id).Updates(map[string]any{
+		"consecutive_errs": consecutiveErrs,
+		"cooldown_until":   cooldownUntil,
+		"last_status":      lastStatus,
+	}).Error
 }
 
 func (s *Store) SetProviderKeyEnabled(id int64, enabled bool) error {
-	_, err := s.db.Exec(`UPDATE provider_keys SET enabled=? WHERE id=?`, boolToInt(enabled), id)
-	return err
+	return s.db.Model(&ProviderKey{}).Where("id = ?", id).Update("enabled", enabled).Error
 }
 
 func (s *Store) ListAPIKeys() ([]APIKey, error) {
-	rows, err := s.db.Query(`SELECT id,key_value,name,max_rpm,max_tpm,allowed_models_json,rate_multiplier,enabled FROM api_keys ORDER BY id`)
-	if err != nil {
-		return nil, err
+	var out []APIKey
+	err := s.db.Order("id").Find(&out).Error
+	return out, err
+}
+
+func (s *Store) UpsertAPIKey(k APIKey) (int64, error) {
+	if strings.TrimSpace(k.KeyValue) == "" {
+		return 0, errors.New("key_value is required")
 	}
-	defer rows.Close()
-	out := make([]APIKey, 0)
-	for rows.Next() {
-		var x APIKey
-		var enabled int
-		if err := rows.Scan(&x.ID, &x.KeyValue, &x.Name, &x.MaxRPM, &x.MaxTPM, &x.AllowedModels, &x.RateMultiplier, &enabled); err != nil {
-			return nil, err
+	if strings.TrimSpace(k.Name) == "" {
+		return 0, errors.New("name is required")
+	}
+	if k.RateMultiplier <= 0 {
+		k.RateMultiplier = 1
+	}
+
+	if k.ID > 0 {
+		if err := s.db.Model(&APIKey{}).Where("id = ?", k.ID).Updates(map[string]any{
+			"key_value":       k.KeyValue,
+			"name":            k.Name,
+			"max_rpm":         k.MaxRPM,
+			"max_tpm":         k.MaxTPM,
+			"allowed_models":  k.AllowedModels,
+			"rate_multiplier": k.RateMultiplier,
+			"enabled":         k.Enabled,
+		}).Error; err != nil {
+			return 0, err
 		}
-		x.Enabled = enabled == 1
-		out = append(out, x)
+		return k.ID, nil
 	}
-	return out, rows.Err()
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key_value"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name", "max_rpm", "max_tpm", "allowed_models", "rate_multiplier", "enabled"}),
+	}).Create(&k).Error; err != nil {
+		return 0, err
+	}
+	return k.ID, nil
+}
+
+func (s *Store) DeleteAPIKey(id int64) error {
+	return s.db.Where("id = ?", id).Delete(&APIKey{}).Error
 }
 
 func (s *Store) ListRules() ([]Rule, error) {
-	rows, err := s.db.Query(`SELECT id,name,priority,enabled,condition_js,action_json FROM rules ORDER BY priority ASC, id ASC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]Rule, 0)
-	for rows.Next() {
-		var x Rule
-		var enabled int
-		if err := rows.Scan(&x.ID, &x.Name, &x.Priority, &enabled, &x.ConditionJS, &x.ActionJSON); err != nil {
-			return nil, err
-		}
-		x.Enabled = enabled == 1
-		out = append(out, x)
-	}
-	return out, rows.Err()
+	var out []Rule
+	err := s.db.Order("priority asc, id asc").Find(&out).Error
+	return out, err
 }
 
 func (s *Store) UpsertRule(r Rule) (int64, error) {
@@ -411,50 +492,35 @@ func (s *Store) UpsertRule(r Rule) (int64, error) {
 	if r.Priority <= 0 {
 		r.Priority = 100
 	}
-
 	if r.ID > 0 {
-		_, err := s.db.Exec(
-			`UPDATE rules SET name=?, priority=?, enabled=?, condition_js=?, action_json=? WHERE id=?`,
-			r.Name, r.Priority, boolToInt(r.Enabled), r.ConditionJS, r.ActionJSON, r.ID,
-		)
-		if err != nil {
+		if err := s.db.Model(&Rule{}).Where("id = ?", r.ID).Updates(map[string]any{
+			"name":         r.Name,
+			"priority":     r.Priority,
+			"enabled":      r.Enabled,
+			"condition_js": r.ConditionJS,
+			"action_json":  r.ActionJSON,
+		}).Error; err != nil {
 			return 0, err
 		}
 		return r.ID, nil
 	}
-
-	res, err := s.db.Exec(
-		`INSERT INTO rules(name, priority, enabled, condition_js, action_json) VALUES(?,?,?,?,?)`,
-		r.Name, r.Priority, boolToInt(r.Enabled), r.ConditionJS, r.ActionJSON,
-	)
-	if err != nil {
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"priority", "enabled", "condition_js", "action_json"}),
+	}).Create(&r).Error; err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	return r.ID, nil
 }
 
 func (s *Store) DeleteRule(id int64) error {
-	_, err := s.db.Exec(`DELETE FROM rules WHERE id=?`, id)
-	return err
+	return s.db.Where("id = ?", id).Delete(&Rule{}).Error
 }
 
 func (s *Store) ListSchedules() ([]GroupSchedule, error) {
-	rows, err := s.db.Query(`SELECT id,group_name,weekday_mask,start_hhmm,end_hhmm,multiplier,enabled FROM group_schedules ORDER BY group_name,id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]GroupSchedule, 0)
-	for rows.Next() {
-		var x GroupSchedule
-		var enabled int
-		if err := rows.Scan(&x.ID, &x.GroupName, &x.WeekdayMask, &x.StartHHMM, &x.EndHHMM, &x.Multiplier, &enabled); err != nil {
-			return nil, err
-		}
-		x.Enabled = enabled == 1
-		out = append(out, x)
-	}
-	return out, rows.Err()
+	var out []GroupSchedule
+	err := s.db.Order("group_name asc, id asc").Find(&out).Error
+	return out, err
 }
 
 func (s *Store) UpsertSchedule(sc GroupSchedule) (int64, error) {
@@ -473,31 +539,52 @@ func (s *Store) UpsertSchedule(sc GroupSchedule) (int64, error) {
 	if sc.Multiplier <= 0 {
 		sc.Multiplier = 1
 	}
-
 	if sc.ID > 0 {
-		_, err := s.db.Exec(
-			`UPDATE group_schedules SET group_name=?, weekday_mask=?, start_hhmm=?, end_hhmm=?, multiplier=?, enabled=? WHERE id=?`,
-			sc.GroupName, sc.WeekdayMask, sc.StartHHMM, sc.EndHHMM, sc.Multiplier, boolToInt(sc.Enabled), sc.ID,
-		)
-		if err != nil {
+		if err := s.db.Model(&GroupSchedule{}).Where("id = ?", sc.ID).Updates(map[string]any{
+			"group_name":   sc.GroupName,
+			"weekday_mask": sc.WeekdayMask,
+			"start_hhmm":   sc.StartHHMM,
+			"end_hhmm":     sc.EndHHMM,
+			"multiplier":   sc.Multiplier,
+			"enabled":      sc.Enabled,
+		}).Error; err != nil {
 			return 0, err
 		}
 		return sc.ID, nil
 	}
-
-	res, err := s.db.Exec(
-		`INSERT INTO group_schedules(group_name, weekday_mask, start_hhmm, end_hhmm, multiplier, enabled) VALUES(?,?,?,?,?,?)`,
-		sc.GroupName, sc.WeekdayMask, sc.StartHHMM, sc.EndHHMM, sc.Multiplier, boolToInt(sc.Enabled),
-	)
-	if err != nil {
+	if err := s.db.Create(&sc).Error; err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	return sc.ID, nil
 }
 
 func (s *Store) DeleteSchedule(id int64) error {
-	_, err := s.db.Exec(`DELETE FROM group_schedules WHERE id=?`, id)
-	return err
+	return s.db.Where("id = ?", id).Delete(&GroupSchedule{}).Error
+}
+
+func (s *Store) AddUsage(u UsageRecord) error {
+	return s.db.Create(&u).Error
+}
+
+func (s *Store) UsageSummaryLast24h() (map[string]int64, error) {
+	since := time.Now().Add(-24 * time.Hour).Unix()
+	type row struct {
+		APIKey string
+		Total  int64
+	}
+	var rows []row
+	if err := s.db.Model(&UsageRecord{}).
+		Select("api_key, SUM(total_tokens) as total").
+		Where("at_unix >= ?", since).
+		Group("api_key").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		out[r.APIKey] = r.Total
+	}
+	return out, nil
 }
 
 func (s *Store) ExportRuntimeConfig() (RuntimeConfigExport, error) {
@@ -505,11 +592,11 @@ func (s *Store) ExportRuntimeConfig() (RuntimeConfigExport, error) {
 	if err != nil {
 		return RuntimeConfigExport{}, err
 	}
-	providerKeys, err := s.ListProviderKeys("")
+	pkeys, err := s.ListProviderKeys("")
 	if err != nil {
 		return RuntimeConfigExport{}, err
 	}
-	apiKeys, err := s.ListAPIKeys()
+	apikeys, err := s.ListAPIKeys()
 	if err != nil {
 		return RuntimeConfigExport{}, err
 	}
@@ -523,119 +610,78 @@ func (s *Store) ExportRuntimeConfig() (RuntimeConfigExport, error) {
 	}
 	return RuntimeConfigExport{
 		Providers:    providers,
-		ProviderKeys: providerKeys,
-		APIKeys:      apiKeys,
+		ProviderKeys: pkeys,
+		APIKeys:      apikeys,
 		Rules:        rules,
 		Schedules:    schedules,
 	}, nil
 }
 
 func (s *Store) ReplaceRulesAndSchedules(rules []Rule, schedules []GroupSchedule) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
-	if _, err = tx.Exec(`DELETE FROM rules`); err != nil {
-		return err
-	}
-	for _, r := range rules {
-		if r.Name == "" || r.ConditionJS == "" || r.ActionJSON == "" {
-			continue
-		}
-		if r.Priority <= 0 {
-			r.Priority = 100
-		}
-		if _, err = tx.Exec(
-			`INSERT INTO rules(name, priority, enabled, condition_js, action_json) VALUES(?,?,?,?,?)`,
-			r.Name, r.Priority, boolToInt(r.Enabled), r.ConditionJS, r.ActionJSON,
-		); err != nil {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("1 = 1").Delete(&Rule{}).Error; err != nil {
 			return err
 		}
-	}
-
-	if _, err = tx.Exec(`DELETE FROM group_schedules`); err != nil {
-		return err
-	}
-	for _, sc := range schedules {
-		if sc.GroupName == "" {
-			continue
-		}
-		if sc.WeekdayMask == "" {
-			sc.WeekdayMask = "1,2,3,4,5,6,7"
-		}
-		if sc.StartHHMM == "" {
-			sc.StartHHMM = "00:00"
-		}
-		if sc.EndHHMM == "" {
-			sc.EndHHMM = "23:59"
-		}
-		if sc.Multiplier <= 0 {
-			sc.Multiplier = 1
-		}
-		if _, err = tx.Exec(
-			`INSERT INTO group_schedules(group_name, weekday_mask, start_hhmm, end_hhmm, multiplier, enabled) VALUES(?,?,?,?,?,?)`,
-			sc.GroupName, sc.WeekdayMask, sc.StartHHMM, sc.EndHHMM, sc.Multiplier, boolToInt(sc.Enabled),
-		); err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
-func (s *Store) AddUsage(u UsageRecord) error {
-	_, err := s.db.Exec(
-		`INSERT INTO usage_records(at_unix,api_key,provider,provider_key,model,prompt_tokens,completion_tokens,total_tokens)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		u.AtUnix, u.APIKey, u.Provider, u.ProviderKey, u.Model, u.PromptTokens, u.CompletionTokens, u.TotalTokens,
-	)
-	return err
-}
-
-func (s *Store) UsageSummaryLast24h() (map[string]int64, error) {
-	since := time.Now().Add(-24 * time.Hour).Unix()
-	rows, err := s.db.Query(`SELECT api_key, SUM(total_tokens) FROM usage_records WHERE at_unix>=? GROUP BY api_key`, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]int64{}
-	for rows.Next() {
-		var k string
-		var v sql.NullInt64
-		if err := rows.Scan(&k, &v); err != nil {
-			return nil, err
-		}
-		if v.Valid {
-			out[k] = v.Int64
-		}
-	}
-	return out, rows.Err()
-}
-
-func dir(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' || path[i] == '\\' {
-			if i == 0 {
-				return "."
+		if len(rules) > 0 {
+			for _, r := range rules {
+				if strings.TrimSpace(r.Name) == "" || strings.TrimSpace(r.ConditionJS) == "" || strings.TrimSpace(r.ActionJSON) == "" {
+					continue
+				}
+				if r.Priority <= 0 {
+					r.Priority = 100
+				}
+				if err := tx.Create(&Rule{
+					Name:        r.Name,
+					Priority:    r.Priority,
+					Enabled:     r.Enabled,
+					ConditionJS: r.ConditionJS,
+					ActionJSON:  r.ActionJSON,
+				}).Error; err != nil {
+					return err
+				}
 			}
-			return path[:i]
 		}
-	}
-	return "."
+		if err := tx.Where("1 = 1").Delete(&GroupSchedule{}).Error; err != nil {
+			return err
+		}
+		if len(schedules) > 0 {
+			for _, sc := range schedules {
+				if sc.GroupName == "" {
+					continue
+				}
+				if sc.WeekdayMask == "" {
+					sc.WeekdayMask = "1,2,3,4,5,6,7"
+				}
+				if sc.StartHHMM == "" {
+					sc.StartHHMM = "00:00"
+				}
+				if sc.EndHHMM == "" {
+					sc.EndHHMM = "23:59"
+				}
+				if sc.Multiplier <= 0 {
+					sc.Multiplier = 1
+				}
+				if err := tx.Create(&GroupSchedule{
+					GroupName:   sc.GroupName,
+					WeekdayMask: sc.WeekdayMask,
+					StartHHMM:   sc.StartHHMM,
+					EndHHMM:     sc.EndHHMM,
+					Multiplier:  sc.Multiplier,
+					Enabled:     sc.Enabled,
+				}).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }
 
-func boolToInt(v bool) int {
-	if v {
-		return 1
+func defaultStr(v, d string) string {
+	if strings.TrimSpace(v) == "" {
+		return d
 	}
-	return 0
+	return v
 }
 
 func max(a, b int) int {
