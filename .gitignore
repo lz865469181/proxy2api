@@ -1,0 +1,12 @@
+# Binaries
+bin/
+*.exe
+*.out
+
+# Go
+*.test
+coverage.out
+
+# Local config
+config/config.yaml
+

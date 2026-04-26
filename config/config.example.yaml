@@ -1,0 +1,89 @@
+server:
+  listen: ":8080"
+
+auth:
+  admin_key: "change-me-admin-key"
+
+db:
+  path: "data/proxy2api.db"
+
+gateway:
+  timeout_seconds: 120
+  sticky_session_header: "session_id"
+  provider_fail_threshold: 3
+  provider_cooldown_seconds: 30
+  timezone: "Asia/Shanghai"
+  reload_seconds: 10
+
+keys:
+  - key: "sk-user-demo"
+    name: "demo-user"
+    max_rpm: 120
+    max_tpm: 300000
+    allowed_models: ["gpt-4o-mini", "gpt-4.1-mini", "claude-3-5-sonnet"]
+    rate_multiplier: 1.0
+
+  - key: "sk-enterprise"
+    name: "enterprise"
+    max_rpm: 600
+    max_tpm: 1500000
+    allowed_models: []
+    rate_multiplier: 1.0
+
+rules:
+  - name: "enterprise-force-openai"
+    match:
+      api_keys: ["sk-enterprise"]
+      model_prefix: "gpt-"
+    action:
+      force_provider: "openai-main"
+      rate_multiplier: 0.8
+
+  - name: "ban-experimental"
+    match:
+      api_keys: []
+      model_prefix: "exp-"
+    action:
+      deny: true
+
+providers:
+  - name: "openai-main"
+    base_url: "https://api.openai.com"
+    upstream_keys:
+      - "sk-openai-provider-key-a"
+      - "sk-openai-provider-key-b"
+    weight: 5
+    models: ["gpt-4o-mini", "gpt-4.1-mini"]
+    model_map: {}
+    max_rpm: 4000
+    max_tpm: 8000000
+    group_name: "premium"
+    recover_interval_sec: 60
+    enabled: true
+
+  - name: "openai-backup"
+    base_url: "https://api.openai.com"
+    upstream_keys:
+      - "sk-openai-backup-key"
+    weight: 2
+    models: ["gpt-4o-mini", "gpt-4.1-mini"]
+    model_map: {}
+    max_rpm: 1000
+    max_tpm: 2000000
+    group_name: "default"
+    recover_interval_sec: 30
+    enabled: true
+
+  - name: "anthropic-via-openai-compatible"
+    base_url: "https://your-anthropic-compatible-endpoint.example.com"
+    upstream_keys:
+      - "provider-key"
+    weight: 2
+    models: ["claude-3-5-sonnet"]
+    model_map:
+      claude-3-5-sonnet: "claude-3-5-sonnet-20240620"
+    max_rpm: 1000
+    max_tpm: 2000000
+    group_name: "default"
+    recover_interval_sec: 45
+    enabled: false
